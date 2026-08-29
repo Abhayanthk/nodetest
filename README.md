@@ -1,4 +1,4 @@
-# Bad Notes Perf Lab
+# Bad Notes Performance Lab
 
 This is a tiny Node notes API with deliberately inefficient code paths for learning and performance testing.
 

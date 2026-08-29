@@ -1,0 +1,21 @@
+{
+  "name": "bad-notes-perf-lab",
+  "version": "1.0.0",
+  "description": "A deliberately inefficient Node notes API for performance learning.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "keywords": [
+    "node",
+    "notes",
+    "performance",
+    "blocking"
+  ],
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  }
+}

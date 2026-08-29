@@ -1,0 +1,9 @@
+[
+  {
+    "id": "1",
+    "title": "Welcome note",
+    "body": "This note lives in a JSON file that gets read and written in inefficient ways.",
+    "createdAt": "2026-08-29T00:00:00.000Z",
+    "updatedAt": "2026-08-29T00:00:00.000Z"
+  }
+]

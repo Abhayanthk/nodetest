@@ -1,10 +1,41 @@
 const http = require("http");
-const fs = require("fs");
+const fs = require("fs").promises;
 const path = require("path");
-const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 3000);
 const DATA_FILE = path.join(__dirname, "..", "data", "notes.json");
+
+// In-memory cache for notes to eliminate disk I/O on hot path
+let cachedNotes = null;
+
+async function loadNotes() {
+  if (cachedNotes !== null) {
+    return cachedNotes;
+  }
+  try {
+    const raw = await fs.readFile(DATA_FILE, "utf8");
+    const notes = JSON.parse(raw);
+    cachedNotes = Array.isArray(notes) ? notes : [];
+  } catch (error) {
+    cachedNotes = [];
+  }
+  return cachedNotes;
+}
+
+async function saveNotes(notes) {
+  cachedNotes = notes;
+  const backupPath = DATA_FILE + ".backup";
+  const json = JSON.stringify(notes, null, 2);
+
+  try {
+    const current = await fs.readFile(DATA_FILE, "utf8");
+    await fs.writeFile(backupPath, current);
+  } catch (err) {
+    // ignore backup error if file doesn't exist yet
+  }
+
+  await fs.writeFile(DATA_FILE, json);
+}
 
 function sendJson(res, statusCode, value) {
   const body = JSON.stringify(value, null, 2);
@@ -21,116 +52,40 @@ function sendNotFound(res) {
   sendJson(res, 404, { error: "not found" });
 }
 
-function blockEventLoop(ms) {
-  const start = Date.now();
-  while (Date.now() - start < ms) {
-    Math.sqrt(Math.random() * Date.now());
-  }
-}
-
-function pointlessCpuWork(multiplier) {
-  const rounds = Math.max(1, multiplier) * 35000;
-  let result = "";
-
-  for (let i = 0; i < rounds; i++) {
-    result = crypto
-      .createHash("sha256")
-      .update(result + i + Date.now())
-      .digest("hex");
-  }
-
-  return result;
-}
-
-function loadNotesBadly() {
-  const rawOnce = fs.readFileSync(DATA_FILE, "utf8");
-  const rawTwice = fs.readFileSync(DATA_FILE, "utf8");
-  const rawThird = fs.readFileSync(DATA_FILE, "utf8");
-
-  const notes = JSON.parse(rawOnce);
-
-  JSON.parse(rawTwice);
-  JSON.stringify(JSON.parse(rawThird));
-
-  for (let i = 0; i < notes.length; i++) {
-    for (let j = 0; j < notes.length; j++) {
-      if (notes[i].id === notes[j].id && i !== j) {
-        notes[i].hasDuplicateMaybe = true;
-      }
-    }
-  }
-
-  return notes;
-}
-
-function saveNotesBadly(notes) {
-  const backupPath = DATA_FILE + ".backup";
-  const tempJson = JSON.stringify(JSON.parse(JSON.stringify(notes)), null, 2);
-
-  fs.writeFileSync(backupPath, fs.readFileSync(DATA_FILE, "utf8"));
-  fs.writeFileSync(DATA_FILE, tempJson);
-  fs.readFileSync(DATA_FILE, "utf8");
-}
-
-function getRequestBodyBadly(req) {
+function getRequestBody(req) {
   return new Promise((resolve) => {
-    let body = "";
-
+    const chunks = [];
     req.on("data", (chunk) => {
-      const text = chunk.toString();
-
-      for (let i = 0; i < text.length; i++) {
-        body += text[i];
-      }
-
-      blockEventLoop(12);
+      chunks.push(chunk);
     });
 
     req.on("end", () => {
       try {
-        const parsed = JSON.parse(JSON.stringify(JSON.parse(body || "{}")));
+        const body = Buffer.concat(chunks).toString("utf8");
+        const parsed = JSON.parse(body || "{}");
         resolve(parsed);
       } catch (error) {
         resolve({});
       }
     });
+
+    req.on("error", () => {
+      resolve({});
+    });
   });
 }
 
-function findNoteSlowly(notes, id) {
-  let found = null;
-
-  for (let i = 0; i < notes.length; i++) {
-    for (let j = 0; j <= i; j++) {
-      if (notes[i].id === id) {
-        found = JSON.parse(JSON.stringify(notes[i]));
-      }
-    }
-  }
-
-  return found;
-}
-
-function parseUrlBadly(req) {
+function parseUrl(req) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pieces = url.pathname.split("/").filter(Boolean);
-
-  for (let i = 0; i < 2000; i++) {
-    url.searchParams.toString();
-    url.pathname.split("/").join("/");
-  }
-
   return { url, pieces };
 }
 
 async function route(req, res) {
   const method = req.method || "GET";
-  const { url, pieces } = parseUrlBadly(req);
-
-  blockEventLoop(25);
+  const { url, pieces } = parseUrl(req);
 
   if (method === "GET" && url.pathname === "/health") {
-    blockEventLoop(50);
     return sendJson(res, 200, {
       ok: true,
       warning: "healthy endpoint still blocks a little"
@@ -141,7 +96,10 @@ async function route(req, res) {
     const requestedMs = Number(url.searchParams.get("ms") || 1000);
     const ms = Math.min(Math.max(requestedMs, 0), 15000);
 
-    blockEventLoop(ms);
+    if (ms > 0) {
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
     return sendJson(res, 200, {
       blockedForMs: ms,
       note: "this route intentionally blocked the event loop"
@@ -149,9 +107,8 @@ async function route(req, res) {
   }
 
   if (method === "GET" && url.pathname === "/stats") {
-    const notes = loadNotesBadly();
+    const notes = await loadNotes();
     const totalTextLength = notes.reduce((sum, note) => {
-      pointlessCpuWork(1);
       return sum + String(note.title || "").length + String(note.body || "").length;
     }, 0);
 
@@ -167,34 +124,33 @@ async function route(req, res) {
   }
 
   if (method === "GET" && pieces.length === 1) {
-    const notes = loadNotesBadly();
+    const notes = await loadNotes();
 
-    notes.sort((a, b) => {
-      pointlessCpuWork(1);
+    const sorted = notes.slice().sort((a, b) => {
       return String(a.createdAt).localeCompare(String(b.createdAt));
     });
 
     return sendJson(res, 200, {
-      count: notes.length,
-      notes
+      count: sorted.length,
+      notes: sorted
     });
   }
 
   if (method === "GET" && pieces.length === 2) {
-    const notes = loadNotesBadly();
-    const note = findNoteSlowly(notes, pieces[1]);
+    const notes = await loadNotes();
+    const id = pieces[1];
+    const note = notes.find(n => n.id === id);
 
     if (!note) {
       return sendNotFound(res);
     }
 
-    pointlessCpuWork(2);
     return sendJson(res, 200, note);
   }
 
   if (method === "POST" && pieces.length === 1) {
-    const input = await getRequestBodyBadly(req);
-    const notes = loadNotesBadly();
+    const input = await getRequestBody(req);
+    const notes = await loadNotes();
     const now = new Date().toISOString();
 
     const note = {
@@ -205,72 +161,50 @@ async function route(req, res) {
       updatedAt: now
     };
 
-    notes.push(note);
-
-    for (let i = 0; i < notes.length; i++) {
-      pointlessCpuWork(1);
-      notes[i] = JSON.parse(JSON.stringify(notes[i]));
-    }
-
-    saveNotesBadly(notes);
-    blockEventLoop(150);
+    const newNotes = [...notes, note];
+    await saveNotes(newNotes);
 
     return sendJson(res, 201, note);
   }
 
   if (method === "PUT" && pieces.length === 2) {
-    const input = await getRequestBodyBadly(req);
-    const notes = loadNotesBadly();
+    const input = await getRequestBody(req);
+    const notes = await loadNotes();
     const id = pieces[1];
-    let updated = null;
-
-    for (let i = 0; i < notes.length; i++) {
-      for (let j = 0; j < notes.length; j++) {
-        pointlessCpuWork(1);
-
-        if (notes[i].id === id) {
-          notes[i].title = String(input.title || notes[i].title || "Untitled");
-          notes[i].body = String(input.body || notes[i].body || "");
-          notes[i].updatedAt = new Date().toISOString();
-          updated = JSON.parse(JSON.stringify(notes[i]));
-        }
-      }
-    }
-
-    if (!updated) {
+    
+    const index = notes.findIndex(n => n.id === id);
+    if (index === -1) {
       return sendNotFound(res);
     }
 
-    saveNotesBadly(notes);
-    blockEventLoop(250);
+    const updatedNote = {
+      ...notes[index],
+      title: String(input.title || notes[index].title || "Untitled"),
+      body: String(input.body || notes[index].body || ""),
+      updatedAt: new Date().toISOString()
+    };
 
-    return sendJson(res, 200, updated);
+    const newNotes = [...notes];
+    newNotes[index] = updatedNote;
+
+    await saveNotes(newNotes);
+
+    return sendJson(res, 200, updatedNote);
   }
 
   if (method === "DELETE" && pieces.length === 2) {
-    const notes = loadNotesBadly();
+    const notes = await loadNotes();
     const id = pieces[1];
-    const nextNotes = [];
-    let removed = null;
-
-    for (let i = 0; i < notes.length; i++) {
-      for (let j = 0; j < 5; j++) {
-        fs.existsSync(DATA_FILE);
-      }
-
-      if (notes[i].id === id) {
-        removed = notes[i];
-      } else {
-        nextNotes.push(notes[i]);
-      }
-    }
-
-    if (!removed) {
+    
+    const index = notes.findIndex(n => n.id === id);
+    if (index === -1) {
       return sendNotFound(res);
     }
 
-    saveNotesBadly(nextNotes);
-    blockEventLoop(350);
+    const removed = notes[index];
+    const newNotes = notes.filter((_, i) => i !== index);
+
+    await saveNotes(newNotes);
 
     return sendJson(res, 200, {
       deleted: true,
@@ -283,7 +217,6 @@ async function route(req, res) {
 
 const server = http.createServer((req, res) => {
   route(req, res).catch((error) => {
-    blockEventLoop(100);
     sendJson(res, 500, {
       error: "server exploded slowly",
       message: error.message
